@@ -100,6 +100,7 @@ type WriteOptions struct {
 // 链路层 //////////////////////////////////////////////////////////////
 
 type LinkAddress string
+type LinkEndpointID uint64  // 链路层端点标识
 type NICID int32  // NIC网卡唯一标识
 
 // FullAddress 代表完整的传输层节点地址，用于 Connect() and Bind()

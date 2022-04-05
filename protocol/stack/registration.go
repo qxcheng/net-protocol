@@ -5,6 +5,7 @@ import (
 	"github.com/qxcheng/net-protocol/pkg/sleep"
 	"github.com/qxcheng/net-protocol/pkg/waiter"
 	tcpip "github.com/qxcheng/net-protocol/protocol"
+	"sync"
 )
 
 
@@ -231,4 +232,36 @@ type LinkAddressCache interface {
 
 	// RemoveWaker removes a waker that has been added in GetLinkAddress().
 	RemoveWaker(nicid tcpip.NICID, addr tcpip.Address, waker *sleep.Waker)
+}
+
+// TransportProtocolFactory functions are used by the stack to instantiate
+// transport protocols.
+type TransportProtocolFactory func() TransportProtocol
+
+// NetworkProtocolFactory provides methods to be used by the stack to
+// instantiate network protocols.
+type NetworkProtocolFactory func() NetworkProtocol
+
+var (
+	// 传输层协议的注册储存结构
+	transportProtocols = make(map[string]TransportProtocolFactory)
+	// 网络层协议的注册存储结构
+	networkProtocols = make(map[string]NetworkProtocolFactory)
+
+	linkEPMu           sync.RWMutex
+	nextLinkEndpointID tcpip.LinkEndpointID = 1
+	linkEndpoints                           = make(map[tcpip.LinkEndpointID]LinkEndpoint)
+)
+
+// 注册一个链路层设备并返回其ID
+func RegisterLinkEndpoint(linkEP LinkEndpoint) tcpip.LinkEndpointID {
+	linkEPMu.Lock()
+	defer linkEPMu.Unlock()
+
+	v := nextLinkEndpointID
+	nextLinkEndpointID++
+
+	linkEndpoints[v] = linkEP
+
+	return v
 }
