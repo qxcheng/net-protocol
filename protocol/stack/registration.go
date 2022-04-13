@@ -85,8 +85,7 @@ type NetworkEndpointID struct {
 
 // NetworkEndpoint 是需要由网络层协议（例如，ipv4，ipv6）的端点实现的接口。
 type NetworkEndpoint interface {
-	// DefaultTTL is the default time-to-live value (or hop limit, in ipv6) for this endpoint.
-	DefaultTTL() uint8
+	DefaultTTL() uint8  // 默认的time-to-live值 (或 hop limit in ipv6)
 
 	// MTU is the maximum transmission unit for this endpoint. This is
 	// generally calculated as the MTU of the underlying data link endpoint
@@ -120,23 +119,15 @@ type NetworkEndpoint interface {
 
 // NetworkProtocol 由（想成为网络栈一部分的）网络层协议实现 (ipv4, ipv6)
 type NetworkProtocol interface {
-	// Number 返回网络层协议号
-	Number() tcpip.NetworkProtocolNumber
-
-	// MinimumPacketSize 返回此网络层协议包的最小值，任何小于此值的包被此协议丢弃
-	MinimumPacketSize() int
-
-	// ParseAddresses 返回此协议包的源ip地址和目的ip地址
-	ParseAddresses(v buffer.View) (src, dst tcpip.Address)
-
+	Number() tcpip.NetworkProtocolNumber  // 返回网络层协议号
+	MinimumPacketSize() int               // 返回包的最小值，任何小于此值的包被此协议丢弃
+	ParseAddresses(v buffer.View) (src, dst tcpip.Address)  // 返回此协议包的源ip地址和目的ip地址
 	// NewEndpoint 创建此协议的端点
 	NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache LinkAddressCache, dispatcher TransportDispatcher, sender LinkEndpoint) (NetworkEndpoint, *tcpip.Error)
-
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
 	// provided option value is invalid.
 	SetOption(option interface{}) *tcpip.Error
-
 	// Option allows retrieving protocol specific option values.
 	// Option returns an error if the option is not supported or the
 	// provided option value is invalid.
@@ -210,7 +201,7 @@ type LinkAddressResolver interface {
 	LinkAddressProtocol() tcpip.NetworkProtocolNumber
 }
 
-// A LinkAddressCache caches link addresses.
+// LinkAddressCache mac地址缓存
 type LinkAddressCache interface {
 	// CheckLocalAddress determines if the given local address exists, and if it
 	// does not exist.
@@ -264,4 +255,12 @@ func RegisterLinkEndpoint(linkEP LinkEndpoint) tcpip.LinkEndpointID {
 	linkEndpoints[v] = linkEP
 
 	return v
+}
+
+// 根据ID找到网卡设备
+func FindLinkEndpoint(id tcpip.LinkEndpointID) LinkEndpoint {
+	linkEPMu.RLock()
+	defer linkEPMu.RUnlock()
+
+	return linkEndpoints[id]
 }

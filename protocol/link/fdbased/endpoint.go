@@ -84,11 +84,12 @@ func New(opts *Options) tcpip.LinkEndpointID {
 		views:       make([]buffer.View, len(BufConfig)),
 		handleLocal: opts.HandleLocal,
 	}
-	// 全局注册链路层设备
+	// 全局注册链路层设备, 返回链路层端点ID
 	return stack.RegisterLinkEndpoint(e)
 }
 
 // Attach 启动从文件描述符中读取数据包的goroutine，并通过提供的分发函数来分发数据报。
+// 实际传递的参数是：*NIC
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.dispatcher = dispatcher
 	// 链接端点不可靠。保存传输端点后，它们将停止发送传出数据包，并拒绝所有传入数据包。

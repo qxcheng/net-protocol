@@ -53,11 +53,6 @@ type pollEvent struct {
 	revents int16
 }
 
-func blockingPoll(fds *pollEvent, nfds int, timeout int64) (int, syscall.Errno) {
-	n, _, e := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(fds)), uintptr(nfds), uintptr(timeout))
-	return int(n), e
-}
-
 // BlockingRead reads from a file descriptor that is set up as non-blocking. If
 // no data is available, it will block in a poll() syscall until the file
 // descirptor becomes readable.

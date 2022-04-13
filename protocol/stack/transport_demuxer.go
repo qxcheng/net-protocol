@@ -1,6 +1,7 @@
 package stack
 
 import (
+	"github.com/qxcheng/net-protocol/pkg/buffer"
 	tcpip "github.com/qxcheng/net-protocol/protocol"
 	"sync"
 )
@@ -27,4 +28,37 @@ type transportEndpoints struct {
 // 它执行两级解复用：首先基于网络层协议和传输协议，然后基于端点ID。
 type transportDemuxer struct {
 	protocol map[protocolIDs]*transportEndpoints
+}
+
+// 新建一个分流器
+func newTransportDemuxer(stack *Stack) *transportDemuxer {
+	d := &transportDemuxer{protocol: make(map[protocolIDs]*transportEndpoints)}
+	// Add each network and transport pair to the demuxer.
+	for netProto := range stack.networkProtocols {
+		for proto := range stack.transportProtocols {
+			d.protocol[protocolIDs{netProto, proto}] = &transportEndpoints{endpoints: make(map[TransportEndpointID]TransportEndpoint)}
+		}
+	}
+	return d
+}
+
+// deliverPacket attempts to deliver the given packet. Returns true if it found
+// an endpoint, false otherwise.
+// 根据传输层的id来找到对应的传输端，再将数据包交给这个传输端处理
+func (d *transportDemuxer) deliverPacket(
+	r *Route, protocol tcpip.TransportProtocolNumber,
+	vv buffer.VectorisedView, id TransportEndpointID) bool {
+
+	// 先看看分流器里有没有注册相关协议端，如果没有则返回false
+
+	return true
+}
+
+// deliverControlPacket attempts to deliver the given control packet. Returns
+// true if it found an endpoint, false otherwise.
+func (d *transportDemuxer) deliverControlPacket(
+	net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber,
+	typ ControlType, extra uint32, vv buffer.VectorisedView, id TransportEndpointID) bool {
+
+	return true
 }

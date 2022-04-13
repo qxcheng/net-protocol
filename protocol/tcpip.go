@@ -1,8 +1,10 @@
 package tcpip
 
 import (
+	"errors"
 	"github.com/qxcheng/net-protocol/pkg/buffer"
 	"github.com/qxcheng/net-protocol/pkg/waiter"
+	"sync/atomic"
 )
 
 // Error 自定义错误相关 ///////////////
@@ -54,6 +56,12 @@ var (
 	ErrNetworkUnreachable    = &Error{msg: "network is unreachable"}
 	ErrMessageTooLong        = &Error{msg: "message too long"}
 	ErrNoBufferSpace         = &Error{msg: "no buffer space available"}
+)
+
+// Errors related to Subnet
+var (
+	errSubnetLengthMismatch = errors.New("subnet length of address and mask differ")
+	errSubnetAddressMasked  = errors.New("subnet address has bits set outside the mask")
 )
 
 // 工具相关 ////////////////////////////////////////////////////////////
@@ -113,33 +121,79 @@ type FullAddress struct {
 
 // 网络层 /////////////////////////////////////////////////////////////
 
-type NetworkProtocolNumber uint32
-type Address string  // 网络层地址
+type NetworkProtocolNumber uint32  // 网络层协议号
+type Address string                // 网络层地址
+type ProtocolAddress struct {
+	Protocol NetworkProtocolNumber
+	Address Address
+}
 type AddressMask string  // 网络层地址的子网掩码
+
 // Subnet is a subnet defined by its address and mask.
 type Subnet struct {
 	address Address
 	mask    AddressMask
 }
 
-// Route is a row in the routing table. It specifies through which NIC (and
+// NewSubnet creates a new Subnet, checking that the address and mask are the same length.
+func NewSubnet(a Address, m AddressMask) (Subnet, error) {
+	if len(a) != len(m) {
+		return Subnet{}, errSubnetLengthMismatch
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i]&^m[i] != 0 {
+			return Subnet{}, errSubnetAddressMasked
+		}
+	}
+	return Subnet{a, m}, nil
+}
+
+// Contains returns true if the address is of the same length and matches the
+// subnet address and mask.
+func (s *Subnet) Contains(a Address) bool {
+	if len(a) != len(s.address) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i]&s.mask[i] != s.address[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Route 路由表的一行. It specifies through which NIC (and
 // gateway) sets of packets should be routed. A row is considered viable if the
 // masked target address matches the destination adddress in the row.
 type Route struct {
 	// Destination is the address that must be matched against the masked
 	// target address to check if this row is viable.
 	Destination Address
-
 	// Mask specifies which bits of the Destination and the target address
 	// must match for this row to be viable.
 	Mask AddressMask
-
 	// Gateway is the gateway to be used if this row is viable.
 	Gateway Address
-
 	// NIC is the id of the nic to be used if this row is viable.
 	NIC NICID
 }
+
+// Match determines if r is viable for the given destination address.
+func (r *Route) Match(addr Address) bool {
+	if len(addr) != len(r.Destination) {
+		return false
+	}
+
+	for i := 0; i < len(r.Destination); i++ {
+		if (addr[i] & r.Mask[i]) != r.Destination[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+
 
 // A ControlMessages contains socket control messages for IP sockets.
 //
@@ -259,9 +313,20 @@ type Endpoint interface {
 
 // 统计相关 //////////////////////////////////////////////////////////////////////
 
-// A StatCounter keeps track of a statistic.
 type StatCounter struct {
 	count uint64
+}
+
+func (s *StatCounter) Increment() {
+	s.IncrementBy(1)
+}
+
+func (s *StatCounter) IncrementBy(v uint64) {
+	atomic.AddUint64(&s.count, v)
+}
+
+func (s *StatCounter) Value() uint64 {
+	return atomic.LoadUint64(&s.count)
 }
 
 // IPStats collects IP-specific stats (both v4 and v6).

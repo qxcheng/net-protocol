@@ -2,6 +2,7 @@ package stack
 
 import (
 	"github.com/qxcheng/net-protocol/pkg/buffer"
+	"github.com/qxcheng/net-protocol/pkg/sleep"
 	tcpip "github.com/qxcheng/net-protocol/protocol"
 	"github.com/qxcheng/net-protocol/protocol/header"
 	"github.com/qxcheng/net-protocol/protocol/ports"
@@ -234,18 +235,14 @@ type TCPEndpointState struct {
 	Sender TCPSenderState
 }
 
-// Stack is a networking stack, with all supported protocols, NICs, and route table.
+// Stack 一个协议栈, with all supported protocols, NICs, and route table.
 type Stack struct {
 	transportProtocols map[tcpip.TransportProtocolNumber]*transportProtocolState
 	networkProtocols   map[tcpip.NetworkProtocolNumber]NetworkProtocol
 	linkAddrResolvers  map[tcpip.NetworkProtocolNumber]LinkAddressResolver
-
 	demux *transportDemuxer
-
 	stats tcpip.Stats
-
 	linkAddrCache *linkAddrCache
-
 	mu         sync.RWMutex
 	nics       map[tcpip.NICID]*NIC
 	forwarding bool
@@ -263,4 +260,160 @@ type Stack struct {
 
 	// clock is used to generate user-visible times.
 	clock tcpip.Clock
+}
+
+// Forwarding returns if the packet forwarding between NICs is enabled.
+func (s *Stack) Forwarding() bool {
+	// TODO: Expose via /proc/sys/net/ipv4/ip_forward.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.forwarding
+}
+
+// FindRoute 路由查找实现，比如当tcp建立连接时，会用该函数得到路由信息
+func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) (Route, *tcpip.Error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// 遍历路由表
+	for i := range s.routeTable {
+		if (id != 0 && id != s.routeTable[i].NIC) || (len(remoteAddr) != 0 && !s.routeTable[i].Match(remoteAddr)) {
+			continue
+		}
+
+		nic := s.nics[s.routeTable[i].NIC]
+		if nic == nil {
+			continue
+		}
+
+		var ref *referencedNetworkEndpoint
+		if len(localAddr) != 0 {
+			ref = nic.findEndpoint(netProto, localAddr, CanBePrimaryEndpoint)
+		} else {
+			ref = nic.primaryEndpoint(netProto)
+		}
+		if ref == nil {
+			continue
+		}
+
+		if len(remoteAddr) == 0 {
+			// If no remote address was provided, then the route
+			// provided will refer to the link local address.
+			remoteAddr = ref.ep.ID().LocalAddress
+		}
+
+		r := makeRoute(netProto, ref.ep.ID().LocalAddress, remoteAddr, nic.linkEP.LinkAddress(), ref)
+		r.NextHop = s.routeTable[i].Gateway
+		return r, nil
+	}
+	return Route{}, tcpip.ErrNoRoute
+}
+
+
+
+// 网卡管理相关 //////////////////////////////////////////////////////////////////////////
+
+// 新建一个网卡对象，并且激活它，激活的意思就是准备好从网卡中读取和写入数据。
+func (s *Stack) createNIC(id tcpip.NICID, name string, linkEP tcpip.LinkEndpointID, enabled bool) *tcpip.Error  {
+	ep := FindLinkEndpoint(linkEP)
+	if ep == nil {
+		return tcpip.ErrBadLinkEndpoint
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 保证网卡ID唯一
+	if  _, ok := s.nics[id]; ok {
+		return tcpip.ErrDuplicateNICID
+	}
+
+	n := newNIC(s, id, name, ep)
+
+	s.nics[id] = n
+	if enabled {
+		n.attachLinkEndpoint()
+	}
+
+	return nil
+}
+
+// CreateNIC 根据nic id和linkEP id来创建和注册一个网卡对象
+func (s *Stack) CreateNIC(id tcpip.NICID, linkEP tcpip.LinkEndpointID) *tcpip.Error {
+	return s.createNIC(id, "", linkEP, true)
+}
+
+// LinkAddressCache 接口实现 ///////////////////////////////////////////////////////////
+
+// CheckLocalAddress 检查本地ip地址是否存在，存在返回网卡id，否则返回0
+func (s *Stack) CheckLocalAddress(nicid tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) tcpip.NICID {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if nicid != 0 {
+		nic := s.nics[nicid]
+		if nic == nil {
+			return 0
+		}
+
+		ref := nic.findEndpoint(protocol, addr, CanBePrimaryEndpoint)
+		if ref == nil {
+			return 0
+		}
+		ref.decRef()  // 因为findEndpoint时会增加引用计数
+
+		return nic.id
+	}
+
+	// 遍历所有NICs.
+	for _, nic := range s.nics {
+		ref := nic.findEndpoint(protocol, addr, CanBePrimaryEndpoint)
+		if ref != nil {
+			ref.decRef()
+			return nic.id
+		}
+	}
+
+	return 0
+}
+
+// AddLinkAddress adds a link address to the stack link cache.
+func (s *Stack) AddLinkAddress(nicid tcpip.NICID, addr tcpip.Address, linkAddr tcpip.LinkAddress) {
+	fullAddr := tcpip.FullAddress{NIC:  nicid, Addr: addr}
+	s.linkAddrCache.add(fullAddr, linkAddr)
+	// TODO: provide a way for a transport endpoint to receive a signal
+	// that AddLinkAddress for a particular address has been called.
+}
+
+// GetLinkAddress 获取链路层地址
+func (s *Stack) GetLinkAddress(
+	nicid tcpip.NICID, addr, localAddr tcpip.Address,
+	protocol tcpip.NetworkProtocolNumber,
+	waker *sleep.Waker) (tcpip.LinkAddress, <-chan struct{}, *tcpip.Error) {
+
+	s.mu.RLock()
+	// 获取网卡对象
+	nic := s.nics[nicid]
+	if nic == nil {
+		s.mu.RUnlock()
+		return "", nil, tcpip.ErrUnknownNICID
+	}
+	s.mu.RUnlock()
+
+	fullAddr := tcpip.FullAddress{NIC: nicid, Addr: addr}
+	// 根据网络层协议号找到对应的地址解析协议，
+	// 如：IPV4协议会得到ARP协议
+	linkRes := s.linkAddrResolvers[protocol]
+	return s.linkAddrCache.get(fullAddr, linkRes, localAddr, nic.linkEP, waker)
+}
+
+// RemoveWaker implements LinkAddressCache.RemoveWaker.
+func (s *Stack) RemoveWaker(nicid tcpip.NICID, addr tcpip.Address, waker *sleep.Waker) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if nic := s.nics[nicid]; nic != nil {
+		fullAddr := tcpip.FullAddress{NIC:nicid, Addr:addr}
+		s.linkAddrCache.removeWaker(fullAddr, waker)
+	}
 }
