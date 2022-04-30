@@ -29,14 +29,14 @@ type TransportEndpointID struct {
 
 // TransportEndpoint 由处理包的传输层协议端点实现(e.g., tcp, udp)
 type TransportEndpoint interface {
-	// HandlePacket 被调用当包到达此传输层端点
+	// HandlePacket 处理到达传输层端点的包
 	HandlePacket(r *Route, id TransportEndpointID, vv buffer.VectorisedView)
 
-	// HandleControlPacket 被调用当控制包（ICMP）到达此传输层端点
+	// HandleControlPacket 处理到达传输层端点的控制包（ICMP）
 	HandleControlPacket(id TransportEndpointID, typ ControlType, extra uint32, vv buffer.VectorisedView)
 }
 
-// TransportProtocol 由（想成为网络栈一部分的）传输层协议实现的接口(e.g., tcp, udp)
+// TransportProtocol 由传输层协议（注册到网络栈）实现的接口(e.g., tcp, udp)
 type TransportProtocol interface {
 	// Number 返回传输层协议号
 	Number() tcpip.TransportProtocolNumber
@@ -85,14 +85,13 @@ type NetworkEndpointID struct {
 
 // NetworkEndpoint 是需要由网络层协议（例如，ipv4，ipv6）的端点实现的接口。
 type NetworkEndpoint interface {
-	DefaultTTL() uint8  // 默认的time-to-live值 (或 hop limit in ipv6)
+	// DefaultTTL 默认的time-to-live值 (或 hop limit in ipv6)
+	DefaultTTL() uint8
 
-	// MTU is the maximum transmission unit for this endpoint. This is
-	// generally calculated as the MTU of the underlying data link endpoint
-	// minus the network endpoint max header length.
+	// MTU 该端点的最大传输单位，由链路层的MTU减去网络层最大的头长度
 	MTU() uint32
 
-	// Capabilities returns the set of capabilities supported by the underlying link-layer endpoint.
+	// Capabilities 返回底层链路层端点支持的方法集
 	Capabilities() LinkEndpointCapabilities
 
 	// MaxHeaderLength returns the maximum size the network (and lower
@@ -101,7 +100,7 @@ type NetworkEndpoint interface {
 	// building.
 	MaxHeaderLength() uint16
 
-	// WritePacket writes a packet to the given destination address and protocol.
+	// WritePacket 向指定地址和协议发包
 	WritePacket(r *Route, hdr buffer.Prependable, payload buffer.VectorisedView, protocol tcpip.TransportProtocolNumber, ttl uint8) *tcpip.Error
 
 	// ID 返回网络层协议端点标识
@@ -244,7 +243,19 @@ var (
 	linkEndpoints                           = make(map[tcpip.LinkEndpointID]LinkEndpoint)
 )
 
-// 注册一个链路层设备并返回其ID
+// RegisterTransportProtocolFactory 在协议栈中注册一个新的传输协议工厂，
+// 以便协议栈可以使用它。此函数在由协议的init函数中使用。
+func RegisterTransportProtocolFactory(name string, p TransportProtocolFactory) {
+	transportProtocols[name] = p
+}
+
+// RegisterNetworkProtocolFactory 在协议栈中注册一个新的网络协议工厂，
+// 以便协议栈可以使用它。此函数在由协议的init函数中使用。
+func RegisterNetworkProtocolFactory(name string, p NetworkProtocolFactory) {
+	networkProtocols[name] = p
+}
+
+// RegisterLinkEndpoint 注册一个链路层设备并返回其ID
 func RegisterLinkEndpoint(linkEP LinkEndpoint) tcpip.LinkEndpointID {
 	linkEPMu.Lock()
 	defer linkEPMu.Unlock()
@@ -257,7 +268,7 @@ func RegisterLinkEndpoint(linkEP LinkEndpoint) tcpip.LinkEndpointID {
 	return v
 }
 
-// 根据ID找到网卡设备
+// FindLinkEndpoint 根据ID找到网卡设备
 func FindLinkEndpoint(id tcpip.LinkEndpointID) LinkEndpoint {
 	linkEPMu.RLock()
 	defer linkEPMu.RUnlock()

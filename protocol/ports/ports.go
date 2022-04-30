@@ -21,3 +21,9 @@ type PortManager struct {
 
 // bindAddresses is a set of IP addresses.
 type bindAddresses map[tcpip.Address]struct{}
+
+
+// NewPortManager 新建一个端口管理器
+func NewPortManager() *PortManager {
+	return &PortManager{allocatedPorts: make(map[portDescriptor]bindAddresses)}
+}

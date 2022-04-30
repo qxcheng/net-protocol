@@ -1,0 +1,1 @@
+// Empty assembly file so empty func definitions work.

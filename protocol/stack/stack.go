@@ -3,12 +3,22 @@ package stack
 import (
 	"github.com/qxcheng/net-protocol/pkg/buffer"
 	"github.com/qxcheng/net-protocol/pkg/sleep"
+	"github.com/qxcheng/net-protocol/pkg/waiter"
 	tcpip "github.com/qxcheng/net-protocol/protocol"
 	"github.com/qxcheng/net-protocol/protocol/header"
 	"github.com/qxcheng/net-protocol/protocol/ports"
 	"github.com/qxcheng/net-protocol/protocol/seqnum"
 	"sync"
 	"time"
+)
+
+const (
+	// ageLimit is set to the same cache stale time used in Linux.
+	ageLimit = 1 * time.Minute
+	// resolutionTimeout is set to the same ARP timeout used in Linux.
+	resolutionTimeout = 1 * time.Second
+	// resolutionAttempts is set to the same ARP retries used in Linux.
+	resolutionAttempts = 3
 )
 
 type transportProtocolState struct {
@@ -34,21 +44,12 @@ type TCPCubicState struct {
 	WEst                    float64
 }
 
-// TCPEndpointID is the unique 4 tuple that identifies a given endpoint.
+// TCPEndpointID 4元组确定一个唯一的TCP端点
 type TCPEndpointID struct {
-	// LocalPort is the local port associated with the endpoint.
-	LocalPort uint16
-
-	// LocalAddress is the local [network layer] address associated with
-	// the endpoint.
-	LocalAddress tcpip.Address
-
-	// RemotePort is the remote port associated with the endpoint.
-	RemotePort uint16
-
-	// RemoteAddress it the remote [network layer] address associated with
-	// the endpoint.
-	RemoteAddress tcpip.Address
+	LocalPort uint16             // 本地端口
+	LocalAddress tcpip.Address   // 本地ip地址
+	RemotePort uint16            // 远程端口
+	RemoteAddress tcpip.Address  // 远程ip地址
 }
 
 // TCPFastRecoveryState holds a copy of the internal fast recovery state of a
@@ -235,6 +236,17 @@ type TCPEndpointState struct {
 	Sender TCPSenderState
 }
 
+// Options contains optional Stack configuration.
+type Options struct {
+	// Clock is an optional clock source used for timestampping packets.
+	//
+	// If no Clock is specified, the clock source will be time.Now.
+	Clock tcpip.Clock
+
+	// Stats are optional statistic counters.
+	Stats tcpip.Stats
+}
+
 // Stack 一个协议栈, with all supported protocols, NICs, and route table.
 type Stack struct {
 	transportProtocols map[tcpip.TransportProtocolNumber]*transportProtocolState
@@ -262,7 +274,68 @@ type Stack struct {
 	clock tcpip.Clock
 }
 
-// Forwarding returns if the packet forwarding between NICs is enabled.
+// New 新建一个协议栈对象
+func New(network []string, transport []string, opts Options) *Stack {
+	clock := opts.Clock
+	if clock == nil {
+		clock = &tcpip.StdClock{}
+	}
+
+	s := &Stack{
+		transportProtocols: make(map[tcpip.TransportProtocolNumber]*transportProtocolState),
+		networkProtocols:   make(map[tcpip.NetworkProtocolNumber]NetworkProtocol),
+		linkAddrResolvers:  make(map[tcpip.NetworkProtocolNumber]LinkAddressResolver),
+		nics:               make(map[tcpip.NICID]*NIC),
+		linkAddrCache:      newLinkAddrCache(ageLimit, resolutionTimeout, resolutionAttempts),
+		PortManager:        ports.NewPortManager(),
+		clock:              clock,
+		stats:              opts.Stats.FillIn(),
+	}
+
+	// 添加指定的网络层协议端，如IPV4
+	for _, name := range network {
+		netProtoFactory, ok := networkProtocols[name]
+		if !ok {
+			continue
+		}
+		netProto := netProtoFactory()
+		s.networkProtocols[netProto.Number()] = netProto
+		// 判断该协议是否支持链路层地址解析协议接口，如果支持添加到 s.linkAddrResolvers 中，
+		// 如：ARP协议会添加 IPV4-ARP 的对应关系
+		// 后面需要地址解析协议的时候会更改网络层协议号来找到相应的地址解析协议
+		if r, ok := netProto.(LinkAddressResolver); ok {
+			s.linkAddrResolvers[r.LinkAddressProtocol()] = r
+		}
+	}
+
+	// 添加传输层协议
+	for _, name := range transport {
+		transProtoFactory, ok := transportProtocols[name]
+		if !ok {
+			continue
+		}
+		transProto := transProtoFactory()
+		s.transportProtocols[transProto.Number()] = &transportProtocolState{
+			proto: transProto,
+		}
+	}
+
+	// 新建协议栈全局传输层分流器
+	s.demux = newTransportDemuxer(s)
+
+	return s
+}
+
+// NowNanoseconds implements tcpip.Clock.NowNanoseconds.
+func (s *Stack) NowNanoseconds() int64 {
+	return s.clock.NowNanoseconds()
+}
+
+func (s *Stack) Stats() tcpip.Stats {
+	return s.stats
+}
+
+// Forwarding 网卡之间是否允许转发包
 func (s *Stack) Forwarding() bool {
 	// TODO: Expose via /proc/sys/net/ipv4/ip_forward.
 	s.mu.RLock()
@@ -270,45 +343,89 @@ func (s *Stack) Forwarding() bool {
 	return s.forwarding
 }
 
-// FindRoute 路由查找实现，比如当tcp建立连接时，会用该函数得到路由信息
-func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) (Route, *tcpip.Error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// 遍历路由表
-	for i := range s.routeTable {
-		if (id != 0 && id != s.routeTable[i].NIC) || (len(remoteAddr) != 0 && !s.routeTable[i].Match(remoteAddr)) {
-			continue
-		}
-
-		nic := s.nics[s.routeTable[i].NIC]
-		if nic == nil {
-			continue
-		}
-
-		var ref *referencedNetworkEndpoint
-		if len(localAddr) != 0 {
-			ref = nic.findEndpoint(netProto, localAddr, CanBePrimaryEndpoint)
-		} else {
-			ref = nic.primaryEndpoint(netProto)
-		}
-		if ref == nil {
-			continue
-		}
-
-		if len(remoteAddr) == 0 {
-			// If no remote address was provided, then the route
-			// provided will refer to the link local address.
-			remoteAddr = ref.ep.ID().LocalAddress
-		}
-
-		r := makeRoute(netProto, ref.ep.ID().LocalAddress, remoteAddr, nic.linkEP.LinkAddress(), ref)
-		r.NextHop = s.routeTable[i].Gateway
-		return r, nil
-	}
-	return Route{}, tcpip.ErrNoRoute
+func (s *Stack) SetForwarding(enable bool) {
+	// TODO: Expose via /proc/sys/net/ipv4/ip_forward.
+	s.mu.Lock()
+	s.forwarding = enable
+	s.mu.Unlock()
 }
 
+// SetRouteTable PS：目的地址指定了网卡
+func (s *Stack) SetRouteTable(table []tcpip.Route) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.routeTable = table
+}
+
+func (s *Stack) GetRouteTable() []tcpip.Route {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]tcpip.Route(nil), s.routeTable...)
+}
+
+// NewEndpoint 创建一个指定的传输层协议端点
+func (s *Stack) NewEndpoint(transport tcpip.TransportProtocolNumber, network tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	t, ok := s.transportProtocols[transport]
+	if !ok {
+		return nil, tcpip.ErrUnknownProtocol
+	}
+
+	return t.proto.NewEndpoint(s, network, waiterQueue)
+}
+
+
+// Option相关 //////////////////////////////////////////////////////////////////////////
+
+func (s *Stack) SetNetworkProtocolOption(network tcpip.NetworkProtocolNumber, option interface{}) *tcpip.Error {
+	netProto, ok := s.networkProtocols[network]
+	if !ok {
+		return tcpip.ErrUnknownProtocol
+	}
+	return netProto.SetOption(option)
+}
+
+// NetworkProtocolOption 取回Option的值到参数中
+// var v ipv4.MyOption
+// err := s.NetworkProtocolOption(tcpip.IPv4ProtocolNumber, &v)
+// if err != nil {
+//   ...
+// }
+func (s *Stack) NetworkProtocolOption(network tcpip.NetworkProtocolNumber, option interface{}) *tcpip.Error {
+	netProto, ok := s.networkProtocols[network]
+	if !ok {
+		return tcpip.ErrUnknownProtocol
+	}
+	return netProto.Option(option)
+}
+
+func (s *Stack) SetTransportProtocolOption(transport tcpip.TransportProtocolNumber, option interface{}) *tcpip.Error {
+	transProtoState, ok := s.transportProtocols[transport]
+	if !ok {
+		return tcpip.ErrUnknownProtocol
+	}
+	return transProtoState.proto.SetOption(option)
+}
+
+// TransportProtocolOption
+// var v tcp.SACKEnabled
+// if err := s.TransportProtocolOption(tcpip.TCPProtocolNumber, &v); err != nil {
+//   ...
+// }
+func (s *Stack) TransportProtocolOption(transport tcpip.TransportProtocolNumber, option interface{}) *tcpip.Error {
+	transProtoState, ok := s.transportProtocols[transport]
+	if !ok {
+		return tcpip.ErrUnknownProtocol
+	}
+	return transProtoState.proto.Option(option)
+}
+
+func (s *Stack) SetTransportProtocolHandler(p tcpip.TransportProtocolNumber, h func(*Route, TransportEndpointID, buffer.VectorisedView) bool) {
+	state := s.transportProtocols[p]
+	if state != nil {
+		state.defaultHandler = h
+	}
+}
 
 
 // 网卡管理相关 //////////////////////////////////////////////////////////////////////////
@@ -342,6 +459,40 @@ func (s *Stack) createNIC(id tcpip.NICID, name string, linkEP tcpip.LinkEndpoint
 func (s *Stack) CreateNIC(id tcpip.NICID, linkEP tcpip.LinkEndpointID) *tcpip.Error {
 	return s.createNIC(id, "", linkEP, true)
 }
+
+// CreateNamedNIC 根据nic id、linkEP id、name来创建和注册一个网卡对象
+func (s *Stack) CreateNamedNIC(id tcpip.NICID, name string, linkEP tcpip.LinkEndpointID) *tcpip.Error {
+	return s.createNIC(id, name, linkEP, true)
+}
+
+// CreateDisabledNIC 根据nic id和linkEP id创建一个网卡对象，但没关联LinkEndpoint
+func (s *Stack) CreateDisabledNIC(id tcpip.NICID, linkEP tcpip.LinkEndpointID) *tcpip.Error {
+	return s.createNIC(id, "", linkEP, false)
+}
+
+func (s *Stack) CreateDisabledNamedNIC(id tcpip.NICID, name string, linkEP tcpip.LinkEndpointID) *tcpip.Error {
+	return s.createNIC(id, name, linkEP, false)
+}
+
+
+// AddAddress 为网卡添加网络层地址
+func (s *Stack) AddAddress(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) *tcpip.Error {
+	return s.AddAddressWithOptions(id, protocol, addr, CanBePrimaryEndpoint)
+}
+
+// AddAddressWithOptions 可以指定新端点能否作为主端点
+func (s *Stack) AddAddressWithOptions(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, peb PrimaryEndpointBehavior) *tcpip.Error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nic := s.nics[id]
+	if nic == nil {
+		return tcpip.ErrUnknownNICID
+	}
+
+	return nic.AddAddressWithOptions(protocol, addr, peb)
+}
+
 
 // LinkAddressCache 接口实现 ///////////////////////////////////////////////////////////
 
@@ -416,4 +567,44 @@ func (s *Stack) RemoveWaker(nicid tcpip.NICID, addr tcpip.Address, waker *sleep.
 		fullAddr := tcpip.FullAddress{NIC:nicid, Addr:addr}
 		s.linkAddrCache.removeWaker(fullAddr, waker)
 	}
+}
+
+
+// FindRoute 路由查找实现，比如当tcp建立连接时，会用该函数得到路由信息
+func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) (Route, *tcpip.Error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// 遍历路由表
+	for i := range s.routeTable {
+		if (id != 0 && id != s.routeTable[i].NIC) || (len(remoteAddr) != 0 && !s.routeTable[i].Match(remoteAddr)) {
+			continue
+		}
+
+		nic := s.nics[s.routeTable[i].NIC]
+		if nic == nil {
+			continue
+		}
+
+		var ref *referencedNetworkEndpoint
+		if len(localAddr) != 0 {
+			ref = nic.findEndpoint(netProto, localAddr, CanBePrimaryEndpoint)
+		} else {
+			ref = nic.primaryEndpoint(netProto)
+		}
+		if ref == nil {
+			continue
+		}
+
+		if len(remoteAddr) == 0 {
+			// If no remote address was provided, then the route
+			// provided will refer to the link local address.
+			remoteAddr = ref.ep.ID().LocalAddress
+		}
+
+		r := makeRoute(netProto, ref.ep.ID().LocalAddress, remoteAddr, nic.linkEP.LinkAddress(), ref)
+		r.NextHop = s.routeTable[i].Gateway
+		return r, nil
+	}
+	return Route{}, tcpip.ErrNoRoute
 }

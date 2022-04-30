@@ -4,10 +4,13 @@ import (
 	"errors"
 	"github.com/qxcheng/net-protocol/pkg/buffer"
 	"github.com/qxcheng/net-protocol/pkg/waiter"
+	"reflect"
 	"sync/atomic"
 )
 
+
 // Error 自定义错误相关 ///////////////
+
 type Error struct {
 	msg string
 	ignoreStats bool
@@ -64,6 +67,7 @@ var (
 	errSubnetAddressMasked  = errors.New("subnet address has bits set outside the mask")
 )
 
+
 // 工具相关 ////////////////////////////////////////////////////////////
 
 // A Clock provides the current time.
@@ -90,7 +94,8 @@ type Payload interface {
 	Size() int
 }
 
-// Options 相关
+
+// Options 相关 //////////////////////////////////////////////////////////////
 
 // WriteOptions contains options for Endpoint.Write.
 type WriteOptions struct {
@@ -426,4 +431,26 @@ type Stats struct {
 
 	// UDP breaks out UDP-specific stats.
 	UDP UDPStats
+}
+
+// FillIn returns a copy of s with nil fields initialized to new StatCounters.
+func (s Stats) FillIn() Stats {
+	fillIn(reflect.ValueOf(&s).Elem())
+	return s
+}
+
+func fillIn(v reflect.Value) {
+	for i := 0; i < v.NumField(); i++ {
+		v := v.Field(i)
+		switch v.Kind() {
+		case reflect.Ptr:
+			if s, ok := v.Addr().Interface().(**StatCounter); ok {
+				if *s == nil {
+					*s = &StatCounter{}
+				}
+			}
+		case reflect.Struct:
+			fillIn(v)
+		}
+	}
 }
