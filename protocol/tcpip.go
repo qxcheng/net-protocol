@@ -2,10 +2,13 @@ package tcpip
 
 import (
 	"errors"
+	"fmt"
 	"github.com/qxcheng/net-protocol/pkg/buffer"
 	"github.com/qxcheng/net-protocol/pkg/waiter"
 	"reflect"
+	"strings"
 	"sync/atomic"
+	"time"
 )
 
 
@@ -67,6 +70,16 @@ var (
 	errSubnetAddressMasked  = errors.New("subnet address has bits set outside the mask")
 )
 
+// ErrSaveRejection indicates a failed save due to unsupported networking state.
+// This type of errors is only used for save logic.
+type ErrSaveRejection struct {
+	Err error
+}
+
+// Error returns a sensible description of the save rejection error.
+func (e ErrSaveRejection) Error() string {
+	return "save rejected due to unsupported networking state: " + e.Err.Error()
+}
 
 // 工具相关 ////////////////////////////////////////////////////////////
 
@@ -83,32 +96,6 @@ type Clock interface {
 	NowMonotonic() int64
 }
 
-// Payload provides an interface around data that is being sent to an endpoint.
-// This allows the endpoint to request the amount of data it needs based on
-// internal buffers without exposing them. 'p.Get(p.Size())' reads all the data.
-type Payload interface {
-	// Get returns a slice containing exactly 'min(size, p.Size())' bytes.
-	Get(size int) ([]byte, *Error)
-
-	// Size returns the payload size.
-	Size() int
-}
-
-
-// Options 相关 //////////////////////////////////////////////////////////////
-
-// WriteOptions contains options for Endpoint.Write.
-type WriteOptions struct {
-	// If To is not nil, write to the given address instead of the endpoint's
-	// peer.
-	To *FullAddress
-
-	// More has the same semantics as Linux's MSG_MORE.
-	More bool
-
-	// EndOfRecord has the same semantics as Linux's MSG_EOR.
-	EndOfRecord bool
-}
 
 // 链路层 //////////////////////////////////////////////////////////////
 
@@ -116,23 +103,75 @@ type LinkAddress string
 type LinkEndpointID uint64  // 链路层端点标识
 type NICID int32  // NIC网卡唯一标识
 
-// FullAddress 代表完整的传输层节点地址，用于 Connect() and Bind()
-type FullAddress struct {
-	NIC NICID  // This may not be used by all endpoint types.
-	Addr Address  // 网络层地址
-	Port uint16  // 传输层端口  This may not be used by all endpoint types.
-}
+
 
 
 // 网络层 /////////////////////////////////////////////////////////////
 
 type NetworkProtocolNumber uint32  // 网络层协议号
-type Address string                // 网络层地址
+
 type ProtocolAddress struct {
 	Protocol NetworkProtocolNumber
 	Address Address
 }
+
 type AddressMask string  // 网络层地址的子网掩码
+
+// String implements Stringer.
+func (a AddressMask) String() string {
+	return Address(a).String()
+}
+
+
+type Address string                // 网络层地址
+
+// String implements the fmt.Stringer interface.
+func (a Address) String() string {
+	switch len(a) {
+	case 4:
+		return fmt.Sprintf("%d.%d.%d.%d", int(a[0]), int(a[1]), int(a[2]), int(a[3]))
+	case 16:
+		// Find the longest subsequence of hexadecimal zeros.
+		start, end := -1, -1
+		for i := 0; i < len(a); i += 2 {
+			j := i
+			for j < len(a) && a[j] == 0 && a[j+1] == 0 {
+				j += 2
+			}
+			if j > i+2 && j-i > end-start {
+				start, end = i, j
+			}
+		}
+
+		var b strings.Builder
+		for i := 0; i < len(a); i += 2 {
+			if i == start {
+				b.WriteString("::")
+				i = end
+				if end >= len(a) {
+					break
+				}
+			} else if i > 0 {
+				b.WriteByte(':')
+			}
+			v := uint16(a[i+0])<<8 | uint16(a[i+1])
+			if v == 0 {
+				b.WriteByte('0')
+			} else {
+				const digits = "0123456789abcdef"
+				for i := uint(3); i < 4; i-- {
+					if v := v >> (i * 4); v != 0 {
+						b.WriteByte(digits[v&0xf])
+					}
+				}
+			}
+		}
+		return b.String()
+	default:
+		return fmt.Sprintf("%x", []byte(a))
+	}
+}
+
 
 // Subnet is a subnet defined by its address and mask.
 type Subnet struct {
@@ -153,6 +192,16 @@ func NewSubnet(a Address, m AddressMask) (Subnet, error) {
 	return Subnet{a, m}, nil
 }
 
+// ID returns the subnet ID.
+func (s *Subnet) ID() Address {
+	return s.address
+}
+
+// Mask returns the subnet mask.
+func (s *Subnet) Mask() AddressMask {
+	return s.mask
+}
+
 // Contains returns true if the address is of the same length and matches the
 // subnet address and mask.
 func (s *Subnet) Contains(a Address) bool {
@@ -166,6 +215,34 @@ func (s *Subnet) Contains(a Address) bool {
 	}
 	return true
 }
+
+// Bits returns the number of ones (network bits) and zeros (host bits) in the subnet mask.
+// 返回子网掩码中的1和0的个数
+func (s *Subnet) Bits() (ones int, zeros int) {
+	for _, b := range []byte(s.mask) {
+		for i := uint(0); i < 8; i++ {
+			if b&(1<<i) == 0 {
+				zeros++
+			} else {
+				ones++
+			}
+		}
+	}
+	return
+}
+
+// Prefix returns the number of bits before the first host bit.
+func (s *Subnet) Prefix() int {
+	for i, b := range []byte(s.mask) {
+		for j := 7; j >= 0; j-- {
+			if b&(1<<uint(j)) == 0 {
+				return i*8 + 7 - j
+			}
+		}
+	}
+	return len(s.mask) * 8
+}
+
 
 // Route 路由表的一行. It specifies through which NIC (and
 // gateway) sets of packets should be routed. A row is considered viable if the
@@ -199,27 +276,54 @@ func (r *Route) Match(addr Address) bool {
 }
 
 
-
-// A ControlMessages contains socket control messages for IP sockets.
-//
-// +stateify savable
-type ControlMessages struct {
-	// HasTimestamp indicates whether Timestamp is valid/set.
-	HasTimestamp bool
-
-	// Timestamp is the time (in ns) that the last packed used to create
-	// the read data was received.
-	Timestamp int64
-}
-
-
 // 传输层 ////////////////////////////////////////////////////////////
 
 type TransportProtocolNumber uint32  // 传输层协议号
 
-// ShutdownFlags represents flags that can be passed to the Shutdown() method
-// of the Endpoint interface.
-type ShutdownFlags int
+type ShutdownFlags int  // work with Shutdown()
+const (
+	ShutdownRead ShutdownFlags = 1 << iota
+	ShutdownWrite
+)
+
+// FullAddress 代表完整的传输层节点地址，用于 Connect() and Bind()
+type FullAddress struct {
+	NIC NICID     // This may not be used by all endpoint types.
+	Addr Address  // 网络层地址
+	Port uint16   // 传输层端口  This may not be used by all endpoint types.
+}
+
+func (fa FullAddress) String() string {
+	return fmt.Sprintf("%d:%s:%d", fa.NIC, fa.Addr, fa.Port)
+}
+
+// Payload provides an interface around data that is being sent to an endpoint.
+// This allows the endpoint to request the amount of data it needs based on
+// internal buffers without exposing them. 'p.Get(p.Size())' reads all the data.
+type Payload interface {
+	// Get returns a slice containing exactly 'min(size, p.Size())' bytes.
+	Get(size int) ([]byte, *Error)
+
+	// Size returns the payload size.
+	Size() int
+}
+
+// SlicePayload implements Payload on top of slices for convenience.
+type SlicePayload []byte
+
+// Get implements Payload.
+func (s SlicePayload) Get(size int) ([]byte, *Error) {
+	if size > s.Size() {
+		size = s.Size()
+	}
+	return s[:size], nil
+}
+
+// Size implements Payload.
+func (s SlicePayload) Size() int {
+	return len(s)
+}
+
 
 // Endpoint 由传输层协议实现 (e.g., tcp, udp)，向用户暴露网络栈的read, write, connect方法等
 type Endpoint interface {
@@ -315,6 +419,122 @@ type Endpoint interface {
 	// *Option types.
 	GetSockOpt(opt interface{}) *Error
 }
+
+// A ControlMessages contains socket control messages for IP sockets.
+type ControlMessages struct {
+	// HasTimestamp indicates whether Timestamp is valid/set.
+	HasTimestamp bool
+
+	// Timestamp is the time (in ns) that the last packed used to create
+	// the read data was received.
+	Timestamp int64
+}
+
+// WriteOptions contains options for Endpoint.Write.
+type WriteOptions struct {
+	// If To is not nil, write to the given address instead of the endpoint's
+	// peer.
+	To *FullAddress
+
+	// More has the same semantics as Linux's MSG_MORE.
+	More bool
+
+	// EndOfRecord has the same semantics as Linux's MSG_EOR.
+	EndOfRecord bool
+}
+
+// ErrorOption is used in GetSockOpt to specify that the last error reported by
+// the endpoint should be cleared and returned.
+type ErrorOption struct{}
+
+// SendBufferSizeOption is used by SetSockOpt/GetSockOpt to specify the send
+// buffer size option.
+type SendBufferSizeOption int
+
+// ReceiveBufferSizeOption is used by SetSockOpt/GetSockOpt to specify the
+// receive buffer size option.
+type ReceiveBufferSizeOption int
+
+// SendQueueSizeOption is used in GetSockOpt to specify that the number of
+// unread bytes in the output buffer should be returned.
+type SendQueueSizeOption int
+
+// ReceiveQueueSizeOption is used in GetSockOpt to specify that the number of
+// unread bytes in the input buffer should be returned.
+type ReceiveQueueSizeOption int
+
+// V6OnlyOption is used by SetSockOpt/GetSockOpt to specify whether an IPv6
+// socket is to be restricted to sending and receiving IPv6 packets only.
+type V6OnlyOption int
+
+// NoDelayOption is used by SetSockOpt/GetSockOpt to specify if data should be
+// sent out immediately by the transport protocol. For TCP, it determines if the
+// Nagle algorithm is on or off.
+type NoDelayOption int
+
+// ReuseAddressOption is used by SetSockOpt/GetSockOpt to specify whether Bind()
+// should allow reuse of local address.
+type ReuseAddressOption int
+
+// PasscredOption is used by SetSockOpt/GetSockOpt to specify whether
+// SCM_CREDENTIALS socket control messages are enabled.
+//
+// Only supported on Unix sockets.
+type PasscredOption int
+
+// TimestampOption is used by SetSockOpt/GetSockOpt to specify whether
+// SO_TIMESTAMP socket control messages are enabled.
+type TimestampOption int
+
+// TCPInfoOption is used by GetSockOpt to expose TCP statistics.
+//
+// TODO: Add and populate stat fields.
+type TCPInfoOption struct {
+	RTT    time.Duration
+	RTTVar time.Duration
+}
+
+// KeepaliveEnabledOption is used by SetSockOpt/GetSockOpt to specify whether
+// TCP keepalive is enabled for this socket.
+type KeepaliveEnabledOption int
+
+// KeepaliveIdleOption is used by SetSockOpt/GetSockOpt to specify the time a
+// connection must remain idle before the first TCP keepalive packet is sent.
+// Once this time is reached, KeepaliveIntervalOption is used instead.
+type KeepaliveIdleOption time.Duration
+
+// KeepaliveIntervalOption is used by SetSockOpt/GetSockOpt to specify the
+// interval between sending TCP keepalive packets.
+type KeepaliveIntervalOption time.Duration
+
+// KeepaliveCountOption is used by SetSockOpt/GetSockOpt to specify the number
+// of un-ACKed TCP keepalives that will be sent before the connection is
+// closed.
+type KeepaliveCountOption int
+
+// MulticastTTLOption is used by SetSockOpt/GetSockOpt to control the default
+// TTL value for multicast messages. The default is 1.
+type MulticastTTLOption uint8
+
+// MembershipOption is used by SetSockOpt/GetSockOpt as an argument to
+// AddMembershipOption and RemoveMembershipOption.
+type MembershipOption struct {
+	NIC           NICID
+	InterfaceAddr Address
+	MulticastAddr Address
+}
+
+// AddMembershipOption is used by SetSockOpt/GetSockOpt to join a multicast
+// group identified by the given multicast address, on the interface matching
+// the given interface address.
+type AddMembershipOption MembershipOption
+
+// RemoveMembershipOption is used by SetSockOpt/GetSockOpt to leave a multicast
+// group identified by the given multicast address, on the interface matching
+// the given interface address.
+type RemoveMembershipOption MembershipOption
+
+
 
 // 统计相关 //////////////////////////////////////////////////////////////////////
 

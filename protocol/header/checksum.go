@@ -1,5 +1,7 @@
 package header
 
+import tcpip "github.com/qxcheng/net-protocol/protocol"
+
 // Checksum 校验和的计算
 func Checksum(buf []byte, initial uint16) uint16 {
 	v := uint32(initial)
@@ -22,4 +24,12 @@ func ChecksumCombine(a, b uint16) uint16 {
 	return uint16(v + v>>16)
 }
 
-
+// PseudoHeaderChecksum calculates the pseudo-header checksum for the
+// given destination protocol and network address, ignoring the length
+// field. Pseudo-headers are needed by transport layers when calculating
+// their own checksum.
+func PseudoHeaderChecksum(protocol tcpip.TransportProtocolNumber, srcAddr tcpip.Address, dstAddr tcpip.Address) uint16 {
+	xsum := Checksum([]byte(srcAddr), 0)
+	xsum = Checksum([]byte(dstAddr), xsum)
+	return Checksum([]byte{0, uint8(protocol)}, xsum)
+}

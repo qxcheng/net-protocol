@@ -2,7 +2,15 @@ package ports
 
 import (
 	tcpip "github.com/qxcheng/net-protocol/protocol"
+	"log"
+	"math"
+	"math/rand"
 	"sync"
+)
+
+const (
+	FirstEphemeral = 16000  // 临时端口的最小值
+	anyIPAddress tcpip.Address = ""
 )
 
 // 端口的唯一标识: 网络层协议-传输层协议-端口号
@@ -22,8 +30,139 @@ type PortManager struct {
 // bindAddresses is a set of IP addresses.
 type bindAddresses map[tcpip.Address]struct{}
 
+// isAvailable 检查ip地址是否可以绑定
+func (b bindAddresses) isAvailable(addr tcpip.Address) bool {
+	if addr == anyIPAddress {
+		return len(b) == 0
+	}
+
+	if _, ok := b[anyIPAddress]; ok {
+		return false
+	}
+	if _, ok := b[addr]; ok {
+		return false
+	}
+
+	return true
+}
+
 
 // NewPortManager 新建一个端口管理器
 func NewPortManager() *PortManager {
 	return &PortManager{allocatedPorts: make(map[portDescriptor]bindAddresses)}
+}
+
+// PickEphemeralPort 从端口管理器中随机分配一个端口，并调用testPort来检测是否可用。
+func (s *PortManager) PickEphemeralPort(testPort func(p uint16) (bool, *tcpip.Error)) (port uint16, err *tcpip.Error) {
+	count := uint16(math.MaxUint16 - FirstEphemeral + 1)
+	offset := uint16(rand.Int31n(int32(count)))
+
+	for i := uint16(0); i < count; i++ {
+		port = FirstEphemeral + (offset + i) % count
+		ok, err := testPort(port)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return port, nil
+		}
+	}
+	return 0, tcpip.ErrNoPortAvailable
+}
+
+// IsPortAvailable 测试端口是否在所有给定协议上可用
+func (s *PortManager) IsPortAvailable(
+	networks []tcpip.NetworkProtocolNumber, transport tcpip.TransportProtocolNumber,
+	addr tcpip.Address, port uint16) bool {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.isPortAvailableLocked(networks, transport, addr, port)
+}
+
+// isPortAvailableLocked 根据参数判断该端口号是否已经被占用了
+func (s *PortManager) isPortAvailableLocked(
+	networks []tcpip.NetworkProtocolNumber, transport tcpip.TransportProtocolNumber,
+	addr tcpip.Address, port uint16) bool {
+
+	for _, network := range networks {
+		desc := portDescriptor{network, transport, port}
+		if addrs, ok := s.allocatedPorts[desc]; ok {
+			if !addrs.isAvailable(addr) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ReservePort 将端口和IP地址绑定在一起，这样别的程序就无法使用已经被绑定的端口。
+// 如果传入的端口不为0，那么会尝试绑定该端口，若该端口没有被占用，那么绑定成功。
+// 如果传人的端口等于0，那么就是告诉协议栈自己分配端口，端口管理器就会随机返回一个端口。
+func (s *PortManager) ReservePort(
+	networks []tcpip.NetworkProtocolNumber, transport tcpip.TransportProtocolNumber,
+	addr tcpip.Address, port uint16) (reservedPort uint16, err *tcpip.Error) {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if port != 0 {
+		if !s.reserveSpecificPort(networks, transport, addr, port) {
+			return 0, tcpip.ErrPortInUse
+		}
+		reservedPort = port
+		log.Printf("new transport: %d, port: %d", transport, reservedPort)
+		return
+	}
+
+	// 随机分配一个未占用的端口
+	reservedPort, err = s.PickEphemeralPort(func(p uint16) (bool, *tcpip.Error) {
+		return s.reserveSpecificPort(networks, transport, addr, p), nil
+	})
+	log.Printf("new transport: %d, port: %d", transport, reservedPort)
+	return
+}
+
+// reserveSpecificPort 尝试根据协议号和IP地址绑定一个端口
+func (s *PortManager) reserveSpecificPort(
+	networks []tcpip.NetworkProtocolNumber, transport tcpip.TransportProtocolNumber,
+	addr tcpip.Address, port uint16) bool {
+
+	if !s.isPortAvailableLocked(networks, transport, addr, port) {
+		return false
+	}
+
+	// 根据给定的网络层协议号（IPV4或IPV6），绑定端口
+	for _, network := range networks {
+		desc := portDescriptor{network, transport, port}
+		m, ok := s.allocatedPorts[desc]
+		if !ok {
+			m = make(bindAddresses)
+			s.allocatedPorts[desc] = m
+		}
+		// 注册该地址被绑定了
+		m[addr] = struct{}{}
+	}
+
+	return true
+}
+
+// ReleasePort 释放绑定的端口，以便别的程序复用。
+func (s *PortManager) ReleasePort(
+	networks []tcpip.NetworkProtocolNumber, transport tcpip.TransportProtocolNumber,
+	addr tcpip.Address, port uint16) {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, network := range networks {
+		desc := portDescriptor{network, transport, port}
+		if m, ok := s.allocatedPorts[desc]; ok {
+			log.Printf("delete transport: %d, port: %d", transport, port)
+			delete(m, addr)
+			if len(m) == 0 {
+				delete(s.allocatedPorts, desc)
+			}
+		}
+	}
 }

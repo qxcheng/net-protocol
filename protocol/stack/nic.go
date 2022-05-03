@@ -25,7 +25,7 @@ type NIC struct {
 	subnets []tcpip.Subnet    // 子网的记录
 }
 
-// PrimaryEndpointBehavior is an enumeration of an endpoint's primacy behavior.
+// PrimaryEndpointBehavior is an enumeration of an endpoint's primary behavior.
 type PrimaryEndpointBehavior int
 
 const (
@@ -55,6 +55,11 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint) *NIC {
 		primary:     make(map[tcpip.NetworkProtocolNumber]*ilist.List),
 		endpoints:   make(map[NetworkEndpointID]*referencedNetworkEndpoint),
 	}
+}
+
+// ID returns the identifier of n.
+func (n *NIC) ID() tcpip.NICID {
+	return n.id
 }
 
 // 添加当前的NIC到链路层设备，激活该NIC

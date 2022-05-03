@@ -364,16 +364,6 @@ func (s *Stack) GetRouteTable() []tcpip.Route {
 	return append([]tcpip.Route(nil), s.routeTable...)
 }
 
-// NewEndpoint 创建一个指定的传输层协议端点
-func (s *Stack) NewEndpoint(transport tcpip.TransportProtocolNumber, network tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	t, ok := s.transportProtocols[transport]
-	if !ok {
-		return nil, tcpip.ErrUnknownProtocol
-	}
-
-	return t.proto.NewEndpoint(s, network, waiterQueue)
-}
-
 
 // Option相关 //////////////////////////////////////////////////////////////////////////
 
@@ -607,4 +597,86 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 		return r, nil
 	}
 	return Route{}, tcpip.ErrNoRoute
+}
+
+
+// 网络层 //////////////////////////////////////////////////////////////////////////
+
+// RemoveAddress removes an existing network-layer address from the specified
+// NIC.
+func (s *Stack) RemoveAddress(id tcpip.NICID, addr tcpip.Address) *tcpip.Error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if nic, ok := s.nics[id]; ok {
+		return nic.RemoveAddress(addr)
+	}
+
+	return tcpip.ErrUnknownNICID
+}
+
+
+// 传输层 //////////////////////////////////////////////////////////////////////////
+
+// NewEndpoint 创建一个指定的传输层协议端点
+func (s *Stack) NewEndpoint(transport tcpip.TransportProtocolNumber, network tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	t, ok := s.transportProtocols[transport]
+	if !ok {
+		return nil, tcpip.ErrUnknownProtocol
+	}
+
+	return t.proto.NewEndpoint(s, network, waiterQueue)
+}
+
+// RegisterTransportEndpoint 协议栈或者NIC的分流器注册给定传输层端点。
+// 收到的与提供的id匹配的数据包将被传送到给定的端点;指定nic是可选的，但特定于nic的ID优先于全局ID。
+// 最终调用 demuxer.registerEndpoint 函数来实现注册。
+func (s *Stack) RegisterTransportEndpoint(
+	nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber,
+	protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint) *tcpip.Error {
+
+	if nicID == 0 {
+		return s.demux.registerEndpoint(netProtos, protocol, id, ep)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nic := s.nics[nicID]
+	if nic == nil {
+		return tcpip.ErrUnknownNICID
+	}
+
+	return nic.demux.registerEndpoint(netProtos, protocol, id, ep)
+}
+
+// UnregisterTransportEndpoint removes the endpoint with the given id from the
+// stack transport dispatcher.
+func (s *Stack) UnregisterTransportEndpoint(
+	nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber,
+	protocol tcpip.TransportProtocolNumber, id TransportEndpointID) {
+
+	if nicID == 0 {
+		s.demux.unregisterEndpoint(netProtos, protocol, id)
+		return
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nic := s.nics[nicID]
+	if nic != nil {
+		nic.demux.unregisterEndpoint(netProtos, protocol, id)
+	}
+}
+
+// JoinGroup joins the given multicast group on the given NIC.
+func (s *Stack) JoinGroup(protocol tcpip.NetworkProtocolNumber, nicID tcpip.NICID, multicastAddr tcpip.Address) *tcpip.Error {
+	// TODO: notify network of subscription via igmp protocol.
+	return s.AddAddressWithOptions(nicID, protocol, multicastAddr, NeverPrimaryEndpoint)
+}
+
+// LeaveGroup leaves the given multicast group on the given NIC.
+func (s *Stack) LeaveGroup(protocol tcpip.NetworkProtocolNumber, nicID tcpip.NICID, multicastAddr tcpip.Address) *tcpip.Error {
+	return s.RemoveAddress(nicID, multicastAddr)
 }
