@@ -2,7 +2,9 @@ package stack
 
 import (
 	"github.com/qxcheng/net-protocol/pkg/buffer"
+	"github.com/qxcheng/net-protocol/pkg/sleep"
 	tcpip "github.com/qxcheng/net-protocol/protocol"
+	"github.com/qxcheng/net-protocol/protocol/header"
 )
 
 // Route represents a route through the networking stack to a given destination.
@@ -33,14 +35,17 @@ func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip
 	}
 }
 
-// NICID returns the id of the NIC from which this route originates.
+// NICID 返回关联的网卡ID
 func (r *Route) NICID() tcpip.NICID {
 	return r.ref.ep.NICID()
 }
 
-// MaxHeaderLength forwards the call to the network endpoint's implementation.
 func (r *Route) MaxHeaderLength() uint16 {
 	return r.ref.ep.MaxHeaderLength()
+}
+
+func (r *Route) Capabilities() LinkEndpointCapabilities {
+	return r.ref.ep.Capabilities()
 }
 
 // Stats returns a mutable copy of current stats.
@@ -48,7 +53,56 @@ func (r *Route) Stats() tcpip.Stats {
 	return r.ref.nic.stack.Stats()
 }
 
-// WritePacket writes the packet through the given route.
+// PseudoHeaderChecksum udp或tcp伪首部校验和的计算
+func (r *Route) PseudoHeaderChecksum(protocol tcpip.TransportProtocolNumber) uint16 {
+	return header.PseudoHeaderChecksum(protocol, r.LocalAddress, r.RemoteAddress)
+}
+
+// Resolve 如有必要，解决尝试解析链接地址的问题。如果地址解析需要阻塞，则返回ErrWouldBlock，
+// 例如等待ARP回复。地址解析完成（成功与否）时通知Waker。
+// 如果需要地址解析，则返回ErrNoLinkAddress和通知通道，以阻止顶级调用者。
+// 地址解析完成后，通道关闭（不管成功与否）。
+func (r *Route) Resolve(waker *sleep.Waker) (<-chan struct{}, *tcpip.Error) {
+	if !r.IsResolutionRequired() {
+		// Nothing to do if there is no cache (which does the resolution on cache miss) or
+		// link address is already known.
+		return nil, nil
+	}
+
+	nextAddr := r.NextHop
+	if nextAddr == "" {
+		// Local link address is already known.
+		if r.RemoteAddress == r.LocalAddress {
+			r.RemoteLinkAddress = r.LocalLinkAddress
+			return nil, nil
+		}
+		nextAddr = r.RemoteAddress
+	}
+	// 调用地址解析协议来解析IP地址
+	linkAddr, ch, err := r.ref.linkCache.GetLinkAddress(r.ref.nic.ID(), nextAddr, r.LocalAddress, r.NetProto, waker)
+	if err != nil {
+		return ch, err
+	}
+	r.RemoteLinkAddress = linkAddr
+	return nil, nil
+}
+
+// RemoveWaker removes a waker that has been added in Resolve().
+func (r *Route) RemoveWaker(waker *sleep.Waker) {
+	nextAddr := r.NextHop
+	if nextAddr == "" {
+		nextAddr = r.RemoteAddress
+	}
+	r.ref.linkCache.RemoveWaker(r.ref.nic.ID(), nextAddr, waker)
+}
+
+// IsResolutionRequired returns true if Resolve() must be called to resolve
+// the link address before the this route can be written to.
+func (r *Route) IsResolutionRequired() bool {
+	return r.ref.linkCache != nil && r.RemoteLinkAddress == ""
+}
+
+// WritePacket 发包
 func (r *Route) WritePacket(hdr buffer.Prependable, payload buffer.VectorisedView,
 	protocol tcpip.TransportProtocolNumber, ttl uint8) *tcpip.Error {
 	err := r.ref.ep.WritePacket(r, hdr, payload, protocol, ttl)
