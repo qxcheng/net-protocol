@@ -560,6 +560,8 @@ func (s *Stack) RemoveWaker(nicid tcpip.NICID, addr tcpip.Address, waker *sleep.
 }
 
 
+// 网络层 //////////////////////////////////////////////////////////////////////////
+
 // FindRoute 路由查找实现，比如当tcp建立连接时，会用该函数得到路由信息
 func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) (Route, *tcpip.Error) {
 	s.mu.RLock()
@@ -598,9 +600,6 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 	}
 	return Route{}, tcpip.ErrNoRoute
 }
-
-
-// 网络层 //////////////////////////////////////////////////////////////////////////
 
 // RemoveAddress removes an existing network-layer address from the specified
 // NIC.
@@ -668,6 +667,13 @@ func (s *Stack) UnregisterTransportEndpoint(
 	if nic != nil {
 		nic.demux.unregisterEndpoint(netProtos, protocol, id)
 	}
+}
+
+func (s *Stack) GetTCPProbe() TCPProbeFunc {
+	s.mu.Lock()
+	p := s.tcpProbeFunc
+	s.mu.Unlock()
+	return p
 }
 
 // JoinGroup joins the given multicast group on the given NIC.
